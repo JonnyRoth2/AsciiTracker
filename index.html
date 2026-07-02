@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ASCII Face</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #stack { position: relative; height: 100%; }
+  #stack pre {
+    margin: 0; position: absolute; left: 50%; top: 50%;
+    transform: translate(-50%, -50%); white-space: pre;
+  }
+  #bg { color: #3a3a3a; }
+  #face { color: #4dff7c; }
+  #status {
+    position: fixed; top: 10px; left: 50%; transform: translateX(-50%);
+    color: #9f9; background: rgba(0,0,0,.7); border: 1px solid #363;
+    font: 13px monospace; padding: 4px 10px; border-radius: 6px; z-index: 2;
+  }
+  #hint {
+    position: fixed; bottom: 8px; left: 50%; transform: translateX(-50%);
+    color: #454; font: 12px monospace; z-index: 2;
+  }
+</style>
+</head>
+<body>
+<div id="status">starting camera…</div>
+<div id="stack"><pre id="bg"></pre><pre id="face"></pre></div>
+<div id="hint">[F] background &nbsp; [Z] zoom &nbsp; [T] tracking</div>
+
+<script>
+(async () => {
+  const statusEl = document.getElementById("status");
+  const bgEl = document.getElementById("bg");
+  const faceEl = document.getElementById("face");
+  const FONT = '10px "Cascadia Mono", Consolas, monospace';
+
+  let showBg = true, zoom = false, track = true;
+  addEventListener("keydown", (e) => {
+    const k = e.key.toLowerCase();
+    if (k === "f") showBg = !showBg;
+    if (k === "z") zoom = !zoom;
+    if (k === "t") track = !track;
+  });
+
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 640, height: 480 },
+    });
+  } catch (err) {
+    statusEl.textContent = "camera error: " + err.message;
+    return;
+  }
+  const video = document.createElement("video");
+  video.srcObject = stream;
+  video.muted = true;
+  await video.play();
+
+  const cap = document.createElement("canvas");
+  cap.width = video.videoWidth;
+  cap.height = video.videoHeight;
+  const cctx = cap.getContext("2d");
+
+  // measure the glyph and force line-height to twice its width, so a cell
+  // is exactly 1:2 -- the backend's CHAR_ASPECT of 0.5
+  const meas = document.createElement("canvas").getContext("2d");
+  meas.font = FONT;
+  const cellW = meas.measureText("M").width;
+  const cellH = cellW * 2;
+  for (const el of [bgEl, faceEl]) {
+    el.style.font = FONT;
+    el.style.lineHeight = cellH + "px";
+  }
+
+  let frames = 0, fps = 0, t0 = performance.now();
+
+  async function tick() {
+    cctx.drawImage(video, 0, 0);
+    const blob = await new Promise((r) => cap.toBlob(r, "image/jpeg", 0.7));
+    const cols = Math.floor(innerWidth / cellW) - 2;
+    const rows = Math.floor((innerHeight - 40) / cellH);
+    let delay = 0; // paced by the round-trip itself
+    try {
+      const res = await fetch(
+        `/frame?cols=${cols}&rows=${rows}&bg=${showBg ? 1 : 0}` +
+          `&zoom=${zoom ? 1 : 0}&track=${track ? 1 : 0}`,
+        { method: "POST", body: blob },
+      );
+      const data = await res.json();
+      bgEl.textContent = data.bg.join("\n");
+      faceEl.textContent = data.face.join("\n");
+      frames++;
+      const now = performance.now();
+      if (now - t0 > 500) {
+        fps = frames / ((now - t0) / 1000);
+        frames = 0;
+        t0 = now;
+      }
+      const state = !track ? "tracking off" : data.tracking ? "tracking" : "no face";
+      statusEl.textContent = state + " · " + fps.toFixed(0) + " fps";
+    } catch (err) {
+      statusEl.textContent = "backend unreachable — is app.py running?";
+      delay = 800;
+    }
+    setTimeout(tick, delay);
+  }
+  tick();
+})();
+</script>
+</body>
+</html>

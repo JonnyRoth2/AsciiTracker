@@ -1,0 +1,6 @@
+# headless build: no GUI windows needed, we render to the terminal.
+# camera capture still works. the trained face model (Haar cascade XML)
+# ships inside this package. pinned <5: OpenCV 5 removed CascadeClassifier.
+opencv-python-headless>=4.8,<5
+numpy
+flask
