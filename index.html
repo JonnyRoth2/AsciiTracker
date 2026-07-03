@@ -22,12 +22,27 @@
     position: fixed; bottom: 8px; left: 50%; transform: translateX(-50%);
     color: #454; font: 12px monospace; z-index: 2;
   }
+  #controls {
+    position: fixed; bottom: 8px; right: 12px; z-index: 2;
+    display: flex; gap: 12px; align-items: center;
+    color: #676; font: 12px monospace;
+    background: rgba(0,0,0,.7); padding: 6px 10px; border-radius: 6px;
+  }
+  #controls label { display: flex; gap: 6px; align-items: center; }
+  #controls input[type="color"] {
+    width: 28px; height: 20px; padding: 0; border: 1px solid #333;
+    border-radius: 4px; background: none; cursor: pointer;
+  }
 </style>
 </head>
 <body>
 <div id="status">starting camera…</div>
 <div id="stack"><pre id="bg"></pre><pre id="face"></pre></div>
 <div id="hint">[F] background &nbsp; [Z] zoom &nbsp; [T] tracking</div>
+<div id="controls">
+  <label>face <input type="color" id="faceColor" value="#4dff7c"></label>
+  <label>bg <input type="color" id="bgColor" value="#3a3a3a"></label>
+</div>
 
 <script>
 (async () => {
@@ -38,11 +53,28 @@
 
   let showBg = true, zoom = false, track = true;
   addEventListener("keydown", (e) => {
+    if (e.target.tagName === "INPUT") return;
     const k = e.key.toLowerCase();
     if (k === "f") showBg = !showBg;
     if (k === "z") zoom = !zoom;
     if (k === "t") track = !track;
   });
+
+  // color pickers drive the two ascii layers; choices survive reloads
+  const faceColor = document.getElementById("faceColor");
+  const bgColor = document.getElementById("bgColor");
+  const saved = JSON.parse(localStorage.getItem("asciiColors") || "{}");
+  if (saved.face) faceColor.value = saved.face;
+  if (saved.bg) bgColor.value = saved.bg;
+  function applyColors() {
+    faceEl.style.color = faceColor.value;
+    bgEl.style.color = bgColor.value;
+    localStorage.setItem("asciiColors",
+      JSON.stringify({ face: faceColor.value, bg: bgColor.value }));
+  }
+  faceColor.addEventListener("input", applyColors);
+  bgColor.addEventListener("input", applyColors);
+  applyColors();
 
   let stream;
   try {
@@ -58,9 +90,11 @@
   video.muted = true;
   await video.play();
 
+  // upload at reduced size: the ascii grid is ~230 cells wide, so 480px of
+  // source is already oversampled — smaller JPEGs cut the per-frame payload
   const cap = document.createElement("canvas");
-  cap.width = video.videoWidth;
-  cap.height = video.videoHeight;
+  cap.width = 480;
+  cap.height = Math.round(480 * video.videoHeight / video.videoWidth);
   const cctx = cap.getContext("2d");
 
   // measure the glyph and force line-height to twice its width, so a cell
@@ -76,35 +110,49 @@
 
   let frames = 0, fps = 0, t0 = performance.now();
 
-  async function tick() {
-    cctx.drawImage(video, 0, 0);
-    const blob = await new Promise((r) => cap.toBlob(r, "image/jpeg", 0.7));
-    const cols = Math.floor(innerWidth / cellW) - 2;
-    const rows = Math.floor((innerHeight - 40) / cellH);
-    let delay = 0; // paced by the round-trip itself
-    try {
-      const res = await fetch(
-        `/frame?cols=${cols}&rows=${rows}&bg=${showBg ? 1 : 0}` +
-          `&zoom=${zoom ? 1 : 0}&track=${track ? 1 : 0}`,
-        { method: "POST", body: blob },
-      );
-      const data = await res.json();
-      bgEl.textContent = data.bg.join("\n");
-      faceEl.textContent = data.face.join("\n");
-      frames++;
-      const now = performance.now();
-      if (now - t0 > 500) {
-        fps = frames / ((now - t0) / 1000);
-        frames = 0;
-        t0 = now;
-      }
-      const state = !track ? "tracking off" : data.tracking ? "tracking" : "no face";
-      statusEl.textContent = state + " · " + fps.toFixed(0) + " fps";
-    } catch (err) {
-      statusEl.textContent = "backend unreachable — is app.py running?";
-      delay = 800;
+  // one persistent websocket: no per-frame connection setup or headers.
+  // up to 2 frames stay in flight so capture/upload overlaps processing,
+  // but stale frames never queue up behind slow ones.
+  const ws = new WebSocket("ws://" + location.host + "/stream");
+  let inflight = 0, lastOpts = "";
+
+  ws.onopen = () => { statusEl.textContent = "connected"; };
+  ws.onclose = () => {
+    statusEl.textContent = "backend disconnected — restart app.py and reload";
+  };
+  ws.onmessage = (e) => {
+    inflight--;
+    const data = JSON.parse(e.data);
+    bgEl.textContent = data.bg.join("\n");
+    faceEl.textContent = data.face.join("\n");
+    frames++;
+    const now = performance.now();
+    if (now - t0 > 500) {
+      fps = frames / ((now - t0) / 1000);
+      frames = 0;
+      t0 = now;
     }
-    setTimeout(tick, delay);
+    const state = !track ? "tracking off" : data.tracking ? "tracking" : "no face";
+    statusEl.textContent = state + " · " + fps.toFixed(0) + " fps";
+  };
+
+  async function tick() {
+    if (ws.readyState === WebSocket.OPEN && inflight < 2) {
+      const cols = Math.floor(innerWidth / cellW) - 2;
+      const rows = Math.floor((innerHeight - 40) / cellH);
+      const opts = JSON.stringify({ cols, rows, bg: showBg, zoom, track });
+      if (opts !== lastOpts) {
+        ws.send(opts);
+        lastOpts = opts;
+      }
+      cctx.drawImage(video, 0, 0, cap.width, cap.height);
+      const blob = await new Promise((r) => cap.toBlob(r, "image/jpeg", 0.6));
+      if (blob && ws.readyState === WebSocket.OPEN) {
+        ws.send(blob);
+        inflight++;
+      }
+    }
+    setTimeout(tick, 30);
   }
   tick();
 })();

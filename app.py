@@ -1,28 +1,25 @@
 #!/usr/bin/env python3
 """Flask backend for the browser version of ascii face.
 
-The page (index.html) captures webcam frames with getUserMedia and POSTs
-each one here as a JPEG. This backend runs the exact same offline pipeline
-as the terminal version -- OpenCV's bundled Haar cascade for detection,
-ascii_face.render() for the character grid -- and returns the grid as JSON
-for the page to display. Nothing external is fetched by either side.
+(A WebSocket is the closest thing browser JavaScript has to a UDP-style
+link: one connection, no per-frame handshakes or HTTP headers. Raw UDP
+sockets aren't available to web pages.)
 """
 
 import argparse
-import threading
+import json
 import time
 
 import cv2
 import numpy as np
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, send_file
+from flask_sock import Sock
 
 import ascii_face as af
 
 app = Flask(__name__)
+sock = Sock(app)
 
-_lock = threading.Lock()
-_box = None
-_last_seen = 0.0
 _cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
@@ -32,46 +29,62 @@ def page():
     return send_file("index.html")
 
 
-@app.post("/frame")
-def frame():
-    global _box, _last_seen
+@sock.route("/stream")
+def stream(ws):
+    """JSON text messages update render options; binary messages are JPEG
+    frames, each answered with the rendered ascii grid. Tracking state is
+    per-connection."""
+    opts = {"cols": 160, "rows": 90, "bg": True, "zoom": False, "track": True}
+    box = None
+    last_seen = 0.0
 
-    buf = np.frombuffer(request.get_data(), np.uint8)
-    bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-    if bgr is None:
-        return jsonify(error="could not decode frame"), 400
-    gray = cv2.cvtColor(cv2.flip(bgr, 1), cv2.COLOR_BGR2GRAY)  # selfie mirror
+    while True:
+        msg = ws.receive()
+        if msg is None:
+            break
+        if isinstance(msg, str):
+            opts.update(json.loads(msg))
+            continue
 
-    max_cols = min(int(request.args.get("cols", 160)), 400)
-    max_rows = min(int(request.args.get("rows", 90)), 200)
-    show_bg = request.args.get("bg", "1") == "1"
-    zoom = request.args.get("zoom", "0") == "1"
-    track = request.args.get("track", "1") == "1"
+        bgr = cv2.imdecode(np.frombuffer(msg, np.uint8), cv2.IMREAD_COLOR)
+        if bgr is None:
+            continue
+        gray = cv2.cvtColor(cv2.flip(bgr, 1), cv2.COLOR_BGR2GRAY)  # mirror
 
-    with _lock:
-        det = af.detect_face(_cascade, gray) if track else None
+        det = af.detect_face(_cascade, gray) if opts["track"] else None
         now = time.monotonic()
         if det is not None:
-            _box = det if _box is None else _box + (det - _box) * af.SMOOTH
-            _last_seen = now
-        elif _box is not None and (not track or now - _last_seen > af.HOLD_S):
-            _box = None
-        box = None if _box is None else _box.copy()
+            box = det if box is None else box + (det - box) * af.SMOOTH
+            last_seen = now
+        elif box is not None and (not opts["track"]
+                                  or now - last_seen > af.HOLD_S):
+            box = None
 
-    cols, rows = af.fit_grid(max_cols, max_rows, gray.shape[1], gray.shape[0])
-    chars, layer = af.render(gray, box, cols, rows, show_bg, zoom, track)
+        cols, rows = af.fit_grid(min(int(opts["cols"]), 400),
+                                 min(int(opts["rows"]), 200),
+                                 gray.shape[1], gray.shape[0])
+        chars, layer = af.render(gray, box, cols, rows, bool(opts["bg"]),
+                                 bool(opts["zoom"]), bool(opts["track"]))
 
-    # split into two aligned text layers so the page can color them:
-    # dim background chars and bright face chars never share a cell
-    bg_rows = ["".join(np.where(layer[r], " ", chars[r])) for r in range(rows)]
-    face_rows = ["".join(np.where(layer[r], chars[r], " ")) for r in range(rows)]
-    return jsonify(bg=bg_rows, face=face_rows, tracking=box is not None)
+        # two aligned text layers so the page can color them independently
+        bg_rows = ["".join(np.where(layer[r], " ", chars[r]))
+                   for r in range(rows)]
+        face_rows = ["".join(np.where(layer[r], chars[r], " "))
+                     for r in range(rows)]
+        ws.send(json.dumps({"bg": bg_rows, "face": face_rows,
+                            "tracking": box is not None}))
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(
+        description="websocket backend for the browser ascii face")
     ap.add_argument("--port", type=int, default=8765)
     args = ap.parse_args()
+
+    # keep-alive for page loads; the stream itself is one long connection
+    from werkzeug.serving import WSGIRequestHandler
+    WSGIRequestHandler.protocol_version = "HTTP/1.1"
+
     print("open http://localhost:%d in your Windows browser" % args.port)
     app.run(host="127.0.0.1", port=args.port, threaded=True)
 
