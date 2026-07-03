@@ -12,6 +12,7 @@ font (Ctrl+minus) to get more character cells and therefore more detail.
 import argparse
 import contextlib
 import itertools
+import math
 import os
 import shutil
 import sys
@@ -93,6 +94,116 @@ def detect_face(cascade, gray):
     return np.array([x, y, w, h], dtype=np.float64) / scale
 
 
+def detect_expression(eye_cascade, smile_cascade, gray, box):
+    """Expression signals for the avatar: (eyes_found, smile_found,
+    mouth_openness). Eyes and smile come from two more trained cascades that
+    ship inside the opencv package; mouth openness is the fraction of dark
+    "cavity" pixels in the mouth region, so talking animates continuously.
+    All three are noisy per frame -- callers should smooth over time."""
+    vh, vw = gray.shape
+    x0, y0 = max(0, int(box[0])), max(0, int(box[1]))
+    x1 = min(vw, int(box[0] + box[2]))
+    y1 = min(vh, int(box[1] + box[3]))
+    roi = gray[y0:y1, x0:x1]
+    h, w = roi.shape
+    if h < 24 or w < 24:
+        return True, False, 0.0
+    eyes = eye_cascade.detectMultiScale(
+        roi[: h // 2], 1.1, 5, minSize=(w // 12, w // 12))
+    smiles = smile_cascade.detectMultiScale(
+        roi[h // 2 :], 1.7, 20, minSize=(w // 4, h // 8))
+
+    mreg = roi[int(h * 0.62):int(h * 0.88), int(w * 0.30):int(w * 0.70)]
+    mouth = 0.0
+    if mreg.size:
+        dark = (mreg < np.median(roi) * 0.55).mean()
+        mouth = float(np.clip((dark - 0.04) / 0.30, 0.0, 1.0))
+    return len(eyes) > 0, len(smiles) > 0, mouth
+
+
+LIGHT = (-0.45, -0.55, 0.70)      # light direction for the avatar shading
+
+
+def draw_head(chars, layer, gx0, gy0, fgw, fgh, tex, u, v, rr, mask,
+              eyes_open, smiling, mouth):
+    """Puppet a shaded 3d ascii head over the grid region: an ellipsoid lit
+    from the upper left, its surface modulated by the real face texture so
+    the drawing wraps around the actual head. Features are drawn on top in
+    cleared patches; `mouth` (0..1) animates talking."""
+    rows, cols = chars.shape
+
+    # lambert shading of an ellipsoid: surface normal is (u, v, nz)
+    nz = np.sqrt(np.clip(1.0 - u * u - v * v, 0.0, 1.0))
+    lam = np.clip(LIGHT[0] * u + LIGHT[1] * v + LIGHT[2] * nz, 0.0, 1.0)
+    shade = (0.18 + 0.82 * lam) * (0.45 + 0.55 * tex)
+    fill = RAMP[np.rint(np.clip(shade, 0.0, 1.0) * (len(RAMP) - 1)).astype(int)]
+    chars[gy0:gy0 + fgh, gx0:gx0 + fgw][mask] = fill[mask]
+    layer[gy0:gy0 + fgh, gx0:gx0 + fgw][mask] = fill[mask] != " "
+
+    # rim: walk a parametric ellipse, pick the char by tangent direction
+    a, b = (fgw - 1) / 2.0, (fgh - 1) / 2.0
+    cx, cy = gx0 + a, gy0 + b
+    for i in range(max(24, 4 * (fgw + fgh))):
+        th = 2 * math.pi * i / max(24, 4 * (fgw + fgh))
+        c = int(round(cx + a * math.cos(th)))
+        r = int(round(cy + b * math.sin(th)))
+        if not (0 <= r < rows and 0 <= c < cols):
+            continue
+        ang = math.degrees(math.atan2(b * math.cos(th),
+                                      -a * math.sin(th))) % 180
+        chars[r, c] = ("-" if ang < 22.5 or ang >= 157.5 else
+                       "\\" if ang < 67.5 else
+                       "|" if ang < 112.5 else "/")
+        layer[r, c] = True
+
+    if fgw < 12 or fgh < 7:
+        return  # too small for features, shaded ball only
+
+    def put_row(r, u0, s, pad=1):
+        # write s centered at column for u0, clearing `pad` cells each side;
+        # spaces inside s clear too, so open mouths read as dark cavities
+        c0 = gx0 + int(round((u0 + 1) / 2 * (fgw - 1))) - len(s) // 2
+        if not 0 <= r < rows:
+            return
+        for i in range(-pad, len(s) + pad):
+            c = c0 + i
+            if 0 <= c < cols:
+                ch = s[i] if 0 <= i < len(s) else " "
+                chars[r, c] = ch
+                layer[r, c] = ch != " "
+
+    def put_text(u0, v0, s, pad=1):
+        put_row(gy0 + int(round((v0 + 1) / 2 * (fgh - 1))), u0, s, pad)
+
+    n = max(1, fgw // 30)                        # feature width scales up
+    eye = "(" + "O" * n + ")" if eyes_open else "-" * (n + 2)
+    put_text(-0.4, -0.25, eye)
+    put_text(0.4, -0.25, eye)
+    if fgh >= 12:
+        bv = -0.5 - (0.08 if smiling else 0.0)   # brows lift with a smile
+        put_text(-0.4, bv, "~" * (n + 2))
+        put_text(0.4, bv, "~" * (n + 2))
+        put_text(0, 0.0, "|", pad=0)
+        put_text(0, 0.16, "|", pad=0)
+
+    # mouth: openness drives talking; a smile curves the closed mouth
+    w = max(3, int(fgw * 0.20))
+    if mouth < 0.15:
+        rws = ["\\" + "_" * w + "/"] if smiling else ["-" * (w + 2)]
+    elif mouth < 0.45:
+        rws = ["(" + "_" * w + ")"]
+    elif mouth < 0.75:
+        rws = ["/" + " " * w + "\\",
+               "\\" + "_" * w + "/"]
+    else:
+        rws = ["/" + "-" * w + "\\",
+               "|" + " " * w + "|",
+               "\\" + "_" * w + "/"]
+    r0 = gy0 + int(round((0.52 + 1) / 2 * (fgh - 1))) - (len(rws) - 1) // 2
+    for j, s in enumerate(rws):
+        put_row(r0 + j, 0, s)
+
+
 def pad_box(box, vw, vh):
     """Padded head box as clamped integer pixel bounds x0, y0, x1, y1."""
     x, y, w, h = box
@@ -115,7 +226,8 @@ def fit_grid(max_cols, max_rows, w, h):
     return max(cols, 2), max(rows, 2)
 
 
-def render(gray, box, cols, rows, show_bg, zoom, track=True):
+def render(gray, box, cols, rows, show_bg, zoom, track=True,
+           avatar=False, eyes_open=True, smiling=False, mouth=0.0):
     """Build the character grid and a face/background layer mask."""
     vh, vw = gray.shape
     chars = np.full((rows, cols), " ", dtype="<U1")
@@ -157,20 +269,29 @@ def render(gray, box, cols, rows, show_bg, zoom, track=True):
     face = cv2.resize(crop, (fgw, fgh),
                       interpolation=cv2.INTER_AREA).astype(np.float32)
 
-    # oval head mask with a feathered edge: brightness fades to blank near
-    # the rim, so there is no visible boundary shape around the head
+    # oval head mask; contrast-stretch within it so facial features pop
     yy, xx = np.mgrid[0:fgh, 0:fgw]
     u = (xx + 0.5) / fgw * 2 - 1
     v = (yy + 0.5) / fgh * 2 - 1
     rr = np.sqrt(u * u + v * v)
     mask = rr <= 1.0
-    fade = np.clip((1.0 - rr) / EDGE_FADE, 0.0, 1.0)
-
-    # contrast-stretch within the oval so facial features pop
     lo = np.percentile(face[mask], 2.0)
     hi = np.percentile(face[mask], 98.0)
-    norm = np.clip((face - lo) / max(hi - lo, 16.0), 0.0, 1.0) * fade
-    fchars = RAMP[np.rint(norm * (len(RAMP) - 1)).astype(int)]
+    norm = np.clip((face - lo) / max(hi - lo, 16.0), 0.0, 1.0)
+
+    if avatar:
+        # clear the head's oval, then puppet a 3d-shaded head there,
+        # textured with the real face and animated by the expressions
+        chars[gy0:gy0 + fgh, gx0:gx0 + fgw][mask] = " "
+        layer[gy0:gy0 + fgh, gx0:gx0 + fgw][mask] = False
+        draw_head(chars, layer, gx0, gy0, fgw, fgh, norm, u, v, rr, mask,
+                  eyes_open, smiling, mouth)
+        return chars, layer
+
+    # feathered edge: brightness fades to blank near the rim, so there is
+    # no visible boundary shape around the head
+    fade = np.clip((1.0 - rr) / EDGE_FADE, 0.0, 1.0)
+    fchars = RAMP[np.rint(norm * fade * (len(RAMP) - 1)).astype(int)]
 
     # overlay only where the face produced ink; the dim background runs
     # underneath, so nothing outlines the head
@@ -217,6 +338,10 @@ def main():
 
     cascade = cv2.CascadeClassifier(
         cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    eye_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_eye.xml")
+    smile_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_smile.xml")
 
     os.system("")  # nudge legacy Windows consoles into ANSI mode
     sys.stdout.write("\x1b[?25l\x1b[?7l\x1b[2J")  # hide cursor, no wrap, clear
@@ -226,6 +351,8 @@ def main():
     show_bg = True
     zoom = False
     track = True
+    avatar = False
+    eye_score, smile_score, mouth_score = 1.0, 0.0, 0.0
     fps = 0.0
     last_size = None
 
@@ -255,12 +382,25 @@ def main():
                 ox = (term.columns - cols) // 2
                 oy = (term.lines - 1 - rows) // 2
 
+                eyes_open, smiling, mouth = True, False, 0.0
+                if avatar and box is not None:
+                    ef, sf, mo = detect_expression(eye_cascade, smile_cascade,
+                                                   gray, box)
+                    eye_score = 0.6 * eye_score + 0.4 * ef
+                    smile_score = 0.7 * smile_score + 0.3 * sf
+                    mouth_score = 0.5 * mouth_score + 0.5 * mo
+                    eyes_open = eye_score > 0.4
+                    smiling = smile_score > 0.5
+                    mouth = mouth_score
+
                 chars, layer = render(gray, box, cols, rows, show_bg, zoom,
-                                      track)
+                                      track, avatar, eyes_open, smiling,
+                                      mouth)
                 state = ("tracking off" if not track
-                         else "tracking" if box is not None else "no face")
+                         else "no face" if box is None
+                         else "avatar" if avatar else "tracking")
                 status = ("[q]uit  [f] background  [z] zoom  [t] tracking"
-                          "   fps %4.1f   %s" % (fps, state))
+                          "  [a] avatar   fps %4.1f   %s" % (fps, state))
                 draw(chars, layer, ox, oy, status)
 
                 for key in read_keys():
@@ -273,6 +413,8 @@ def main():
                     elif key == "t":
                         track = not track
                         box = None
+                    elif key == "a":
+                        avatar = not avatar
 
                 dt = time.monotonic() - t0
                 if dt < 1 / FPS_CAP:

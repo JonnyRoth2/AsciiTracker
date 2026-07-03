@@ -38,7 +38,7 @@
 <body>
 <div id="status">starting camera…</div>
 <div id="stack"><pre id="bg"></pre><pre id="face"></pre></div>
-<div id="hint">[F] background &nbsp; [Z] zoom &nbsp; [T] tracking</div>
+<div id="hint">[F] background &nbsp; [Z] zoom &nbsp; [T] tracking &nbsp; [A] avatar</div>
 <div id="controls">
   <label>face <input type="color" id="faceColor" value="#4dff7c"></label>
   <label>bg <input type="color" id="bgColor" value="#3a3a3a"></label>
@@ -51,13 +51,14 @@
   const faceEl = document.getElementById("face");
   const FONT = '10px "Cascadia Mono", Consolas, monospace';
 
-  let showBg = true, zoom = false, track = true;
+  let showBg = true, zoom = false, track = true, avatar = false;
   addEventListener("keydown", (e) => {
     if (e.target.tagName === "INPUT") return;
     const k = e.key.toLowerCase();
     if (k === "f") showBg = !showBg;
     if (k === "z") zoom = !zoom;
     if (k === "t") track = !track;
+    if (k === "a") avatar = !avatar;
   });
 
   // color pickers drive the two ascii layers; choices survive reloads
@@ -132,7 +133,9 @@
       frames = 0;
       t0 = now;
     }
-    const state = !track ? "tracking off" : data.tracking ? "tracking" : "no face";
+    const state = !track ? "tracking off"
+      : !data.tracking ? "no face"
+      : avatar ? "avatar" : "tracking";
     statusEl.textContent = state + " · " + fps.toFixed(0) + " fps";
   };
 
@@ -140,7 +143,7 @@
     if (ws.readyState === WebSocket.OPEN && inflight < 2) {
       const cols = Math.floor(innerWidth / cellW) - 2;
       const rows = Math.floor((innerHeight - 40) / cellH);
-      const opts = JSON.stringify({ cols, rows, bg: showBg, zoom, track });
+      const opts = JSON.stringify({ cols, rows, bg: showBg, zoom, track, avatar });
       if (opts !== lastOpts) {
         ws.send(opts);
         lastOpts = opts;

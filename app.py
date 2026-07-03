@@ -22,6 +22,10 @@ sock = Sock(app)
 
 _cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+_eye_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_eye.xml")
+_smile_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_smile.xml")
 
 
 @app.get("/")
@@ -34,9 +38,11 @@ def stream(ws):
     """JSON text messages update render options; binary messages are JPEG
     frames, each answered with the rendered ascii grid. Tracking state is
     per-connection."""
-    opts = {"cols": 160, "rows": 90, "bg": True, "zoom": False, "track": True}
+    opts = {"cols": 160, "rows": 90, "bg": True, "zoom": False,
+            "track": True, "avatar": False}
     box = None
     last_seen = 0.0
+    eye_score, smile_score, mouth_score = 1.0, 0.0, 0.0
 
     while True:
         msg = ws.receive()
@@ -60,11 +66,24 @@ def stream(ws):
                                   or now - last_seen > af.HOLD_S):
             box = None
 
+        avatar = bool(opts["avatar"])
+        eyes_open, smiling, mouth = True, False, 0.0
+        if avatar and box is not None:
+            ef, sf, mo = af.detect_expression(_eye_cascade, _smile_cascade,
+                                              gray, box)
+            eye_score = 0.6 * eye_score + 0.4 * ef
+            smile_score = 0.7 * smile_score + 0.3 * sf
+            mouth_score = 0.5 * mouth_score + 0.5 * mo
+            eyes_open = eye_score > 0.4
+            smiling = smile_score > 0.5
+            mouth = mouth_score
+
         cols, rows = af.fit_grid(min(int(opts["cols"]), 400),
                                  min(int(opts["rows"]), 200),
                                  gray.shape[1], gray.shape[0])
         chars, layer = af.render(gray, box, cols, rows, bool(opts["bg"]),
-                                 bool(opts["zoom"]), bool(opts["track"]))
+                                 bool(opts["zoom"]), bool(opts["track"]),
+                                 avatar, eyes_open, smiling, mouth)
 
         # two aligned text layers so the page can color them independently
         bg_rows = ["".join(np.where(layer[r], " ", chars[r]))
